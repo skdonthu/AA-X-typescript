@@ -1,1 +1,273 @@
 
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Develop Pipeline
+Parameters:
+  Platform:
+    Type: String
+    Description: Platform
+    Default: 'dip'
+  ServiceName:
+    Type: String
+    Description: Name of Service e.g. Project
+  PipelineBucket:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: Name of bucket to use for the CodePipeline artifacts
+    Default: '/PipelineBucket'
+  GithubRepo:
+    Type: String
+    Description: Github Repo
+  CyclingSecret:
+    Type: String
+    Description: injected secret that should cycle on every deploy
+    NoEcho: true
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Join ['/', ['/aws/pipeline', !Ref 'AWS::StackName']]
+      RetentionInDays: 7
+
+  Build:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${Platform}-${ServiceName}-develop
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LogGroup
+          StreamName: build
+      EncryptionKey: !ImportValue PipelineKMS
+      Description: Build artifact from source
+      ServiceRole: !ImportValue CodeBuildRole
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+          - LOCAL_SOURCE_CACHE
+          - LOCAL_CUSTOM_CACHE
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: REPO_NAME
+            Value: !Ref GithubRepo
+            Type: PLAINTEXT
+          - Name: REPO_URL
+            Value: /DockerUrl
+            Type: PARAMETER_STORE
+          - Name: RELEASE
+            Value: develop
+            Type: PLAINTEXT
+          - Name: ENV
+            Value: development
+            Type: PLAINTEXT
+          - Name: HTTP_PROXY
+            Value: http://squid.ci-develop.theaa.digital:3128
+            Type: PLAINTEXT
+          - Name: HTTPS_PROXY
+            Value: http://squid.ci-develop.theaa.digital:3128
+            Type: PLAINTEXT
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+      Source:
+        Type: CODEPIPELINE
+        Location: !Sub https://github.com/aacom/aa-x-typescript.git
+        BuildSpec: apps/aa-x-web/pipeline/buildspec.yml
+      TimeoutInMinutes: 30
+      VpcConfig:
+        VpcId: !ImportValue VpcId
+        Subnets: !Split [',', !ImportValue PrivateSubnetIds]
+        SecurityGroupIds: [!ImportValue CodeBuildSecurityGroup]
+      Tags:
+        - Key: Project
+          Value: !Sub ${Platform}-${ServiceName}
+
+  PullRequest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${Platform}-${ServiceName}-pullrequests
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LogGroup
+          StreamName: pullrequest
+      BadgeEnabled: False
+      EncryptionKey: !ImportValue PipelineKMS
+      Description: SonarCloud Java Scan on PR
+      ServiceRole: !ImportValue CodeBuildRole
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: False
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED
+            - Type: BASE_REF
+              Pattern: ^refs/heads/.*$
+              ExcludeMatchedPattern: false
+      Artifacts:
+        Type: S3
+        Location: !Sub arn:aws:s3:::dip-micro-owasp-report
+      Cache:
+        Type: NO_CACHE
+      Source:
+        Type: GITHUB
+        Location: !Sub https://github.com/aacom/aa-x-typescript.git
+        BuildSpec: apps/aa-x-web/pipeline/buildspec_pr.yml
+        GitCloneDepth: 0 # 0 forces a full clone
+      TimeoutInMinutes: 30
+      VpcConfig:
+        VpcId: !ImportValue VpcId
+        Subnets: !Split [',', !ImportValue PrivateSubnetIds]
+        SecurityGroupIds: [!ImportValue CodeBuildSecurityGroup]
+      Tags:
+        - Key: Project
+          Value: !Sub ${Platform}-${ServiceName}
+
+  Webhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      AuthenticationConfiguration:
+        SecretToken: !Ref CyclingSecret
+      Filters:
+        - JsonPath: '$.ref'
+          MatchEquals: refs/heads/{Branch}
+      Authentication: GITHUB_HMAC
+      TargetPipeline: !Ref Pipeline
+      TargetAction: Source
+      Name: !Sub ${Platform}-${ServiceName}-develop
+      TargetPipelineVersion: !GetAtt Pipeline.Version
+      RegisterWithThirdParty: 'true'
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !ImportValue CodePipelineRole
+      Name: !Sub ${Platform}-${ServiceName}-develop
+      RestartExecutionOnUpdate: true
+      ArtifactStore:
+        Type: S3
+        EncryptionKey:
+          Id: !ImportValue PipelineKMS
+          Type: KMS
+        Location: !Ref PipelineBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              InputArtifacts: []
+              OutputArtifacts:
+                - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: '1'
+                Provider: GitHub
+              Configuration:
+                Owner: aacom
+                Repo: !Ref GithubRepo
+                Branch: main
+                OAuthToken: '{{resolve:secretsmanager:/Github/Webhook:SecretString:Token}}'
+                PollForSourceChanges: false
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: Deploy
+              Configuration:
+                ProjectName: !Ref Build
+              RunOrder: 1
+
+        - Name: QA
+          Actions:
+            - Name: qa-generate-cloudformation-config
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: generate-cloudformation-config-lambda
+                UserParameters: '{"Env":"qa","EnvId":"develop"}'
+              InputArtifacts:
+                - Name: Deploy
+              OutputArtifacts:
+                - Name: QACloudFormationConfig
+              RunOrder: 1
+            - Name: qa-develop
+              ActionTypeId:
+                Owner: AWS
+                Category: Deploy
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                RoleArn: !ImportValue CloudFormationRole
+                StackName: !Sub ${Platform}-${ServiceName}-qa-develop
+                Capabilities: CAPABILITY_IAM
+                TemplateConfiguration: 'QACloudFormationConfig::config.json'
+                TemplatePath: 'Deploy::cloudformation.yml'
+                ParameterOverrides: |
+                  {
+                    "Version" : { "Fn::GetParam" : ["Deploy", "Overrides.json", "Version"]},
+                    "Env": "qa",
+                    "EnvId": "develop"
+                  }
+                ChangeSetName: qa-develop
+              InputArtifacts:
+                - Name: Deploy
+                - Name: QACloudFormationConfig
+              RunOrder: 2
+#        - Name: TestAutomation
+#          Actions:
+#            - Name: test-automation-framework
+#              ActionTypeId:
+#                Category: Invoke
+#                Owner: AWS
+#                Provider: Lambda
+#                Version: '1'
+#              Configuration:
+#                FunctionName: dip-devops-pipeline-test-automation
+#              InputArtifacts:
+#                - Name: Deploy
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'EventRule'
+      EventPattern:
+        source:
+          - 'aws.codepipeline'
+        detail-type:
+          - 'CodePipeline Pipeline Execution State Change'
+        detail:
+          state:
+            - 'FAILED'
+            - 'SUCCEEDED'
+          pipeline:
+            - !Sub ${Platform}-${ServiceName}-develop
+      State: 'ENABLED'
+      Targets:
+        - Arn: !ImportValue dip-devops-pipeline-notification-SNSTopicARN
+          Id: 'dip-devops-pipeline-notification-SNSTopicARN'
